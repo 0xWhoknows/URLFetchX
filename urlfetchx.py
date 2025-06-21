@@ -13,6 +13,7 @@ import aiofiles
 import aiohttp
 import sys
 import time
+import random
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from typing import Optional, Dict
@@ -85,6 +86,13 @@ class URLProcessor:
         self.stats = {'processed': 0, 'alive': 0, 'dead': 0, 'retries': 0, 'total': 0}
         self.executor = ProcessPoolExecutor(max_workers=self.CPU_WORKERS)
         self.stop_event = asyncio.Event()
+        self.headers_list = [
+            {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'},
+            {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/121.0.0.0 Safari/537.36'},
+            {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) Chrome/120.0.0.0 Safari/537.36'},
+            {'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'},
+            {'User-Agent': 'curl/7.79.1'}
+        ]
 
     async def load_urls(self):
         '''
@@ -135,7 +143,8 @@ class URLProcessor:
         Fetch a URL and return a NetworkResult object.
         '''
         try:
-            async with session.get(url) as response:
+            headers = random.choice(self.headers_list)
+            async with session.get(url, headers=headers,ssl=False) as response:
                 text = await response.text()
                 await self.report_status(url, "ALIVE")
                 return NetworkResult(
@@ -314,7 +323,7 @@ async def main():
     else:
         raise NotImplementedError(f"Platform {sys.platform} not supported")
 
-    filename = input("Enter the filename containing URLs: ").strip()
+    filename = input("Enter the filename : ").strip()
     processor = URLProcessor(filename)
     await processor.run()
 

@@ -30,7 +30,7 @@ class Colors:
     ENDC = '\033[0m'
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)
 class NetworkResult:
     '''
     A dataclass for storing the result of a URL fetch.
@@ -49,7 +49,7 @@ class NetworkResult:
     error_code: Optional[int] = None
 
 
-@dataclass(slots=True, frozen=True)
+@dataclass(frozen=True)
 class ProcessedResult:
     '''
     A dataclass for storing the result of a URL processing.
@@ -72,6 +72,8 @@ class URLProcessor:
     RETRY_LIMIT = 0            # no retries
     RETRY_DELAY = 0.5          # retry delay
     BACKPRESSURE_THRESHOLD = 300 # backpressure threshold
+    MAX_RESPONSE_SIZE = 10 * 1024 * 1024  # 10MB limit
+    QUEUE_MAXSIZE = 1000  # Prevent unbounded queue growth
 
     def __init__(self, filename: str):
         '''
@@ -84,7 +86,7 @@ class URLProcessor:
         self.processed_result_queue = asyncio.Queue()
         self.lock = asyncio.Lock()
         self.stats = {'processed': 0, 'alive': 0, 'dead': 0, 'retries': 0, 'total': 0}
-        self.executor = ProcessPoolExecutor(max_workers=self.CPU_WORKERS)
+        self.executor = None
         self.stop_event = asyncio.Event()
         self.headers_list = [
             {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/122.0.0.0 Safari/537.36'},
@@ -144,8 +146,23 @@ class URLProcessor:
         '''
         try:
             headers = random.choice(self.headers_list)
-            async with session.get(url, headers=headers,ssl=False) as response:
+            async with session.get(url, headers=headers, ssl=False) as response:
+                # Limit response size to prevent memory issues
+                if 'content-length' in response.headers:
+                    content_length = int(response.headers['content-length'])
+                    if content_length > self.MAX_RESPONSE_SIZE:
+                        await self.report_status(url, "DEAD")
+                        return NetworkResult(
+                            url, 0, False, 
+                            error_message=f"Response too large: {content_length} bytes",
+                            attempts=retries
+                        )
+                
+                # Read with size limit
                 text = await response.text()
+                if len(text) > self.MAX_RESPONSE_SIZE:
+                    text = text[:self.MAX_RESPONSE_SIZE]  # Truncate if needed
+                
                 await self.report_status(url, "ALIVE")
                 return NetworkResult(
                     url=url,
@@ -200,17 +217,24 @@ class URLProcessor:
                         net_result.url
                     )
                     processing_time = time.perf_counter() - start
+                    
+                    # Clear content from memory after processing
+                    net_result = None  # Help GC
+                    
                     processed = ProcessedResult(
-                        net_result.url,
-                        net_result.status,
+                        net_result.url if net_result else "unknown",
+                        net_result.status if net_result else 0,
                         True,
                         processed_data=processed_data,
                         processing_time=processing_time
                     )
                 else:
-                    processed = ProcessedResult( net_result.url, 0, False,
+                    processed = ProcessedResult(
+                        net_result.url, 0, False,
                         error_message=net_result.error_message
                     )
+                    net_result = None  # Help GC
+                    
                 await self.processed_result_queue.put(processed)
             except asyncio.CancelledError:
                 break
@@ -272,37 +296,56 @@ class URLProcessor:
             print(f"{Colors.RED}No URLs to process.{Colors.ENDC}")
             return
 
-        output_file = f"results_{self.filename}"
-        connector = aiohttp.TCPConnector(limit=self.MAX_CONCURRENT_REQUESTS, ssl=False)
-        timeout = aiohttp.ClientTimeout(total=60)
+        # Initialize executor here for proper cleanup
+        self.executor = ProcessPoolExecutor(max_workers=self.CPU_WORKERS)
+        
+        try:
+            output_file = f"results_{self.filename}"
+            connector = aiohttp.TCPConnector(limit=self.MAX_CONCURRENT_REQUESTS, ssl=False)
+            timeout = aiohttp.ClientTimeout(total=60)
 
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            writer_task = asyncio.create_task(self.writer_worker(output_file))
+            async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+                writer_task = asyncio.create_task(self.writer_worker(output_file))
 
-            fetchers = [
-                asyncio.create_task(self.fetch_worker(session))
-                for _ in range(self.MAX_CONCURRENT_REQUESTS)
-            ]
+                fetchers = [
+                    asyncio.create_task(self.fetch_worker(session))
+                    for _ in range(self.MAX_CONCURRENT_REQUESTS)
+                ]
 
-            processors = [
-                asyncio.create_task(self.processor_worker())
-                for _ in range(self.executor._max_workers)
-            ]
+                processors = [
+                    asyncio.create_task(self.processor_worker())
+                    for _ in range(self.executor._max_workers)
+                ]
 
-            retry_task = asyncio.create_task(self.retry_worker())
+                retry_task = asyncio.create_task(self.retry_worker())
 
-            await self.url_queue.join()
-            await self.retry_queue.join()
-            await self.network_result_queue.join()
-            await self.processed_result_queue.join()
+                try:
+                    await self.url_queue.join()
+                    await self.retry_queue.join()
+                    await self.network_result_queue.join()
+                    await self.processed_result_queue.join()
+                finally:
+                    self.stop_event.set()
 
-            self.stop_event.set()
+                    # Cancel all tasks
+                    for task in fetchers + processors:
+                        task.cancel()
+                    retry_task.cancel()
 
-            for task in fetchers + processors:
-                task.cancel()
-            retry_task.cancel()
+                    # Wait for cancellation with timeout
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*fetchers, *processors, retry_task, writer_task, return_exceptions=True),
+                            timeout=5.0
+                        )
+                    except asyncio.TimeoutError:
+                        print("Warning: Some tasks didn't finish within timeout")
 
-            await asyncio.gather(*fetchers, *processors, retry_task, writer_task, return_exceptions=True)
+        finally:
+            # Ensure executor is always cleaned up
+            if self.executor:
+                self.executor.shutdown(wait=True)
+                self.executor = None
 
         print(f"\n{Colors.YELLOW}--- Completed ---{Colors.ENDC}")
         print(f"{Colors.WHITE}Total URLs: {self.stats['total']}{Colors.ENDC}")
@@ -310,18 +353,28 @@ class URLProcessor:
         print(f"{Colors.RED}Dead: {self.stats['dead']}{Colors.ENDC}")
         print(f"{Colors.YELLOW}Retries: {self.stats['retries']}{Colors.ENDC}")
         print(f"Results saved to: {Colors.WHITE}{output_file}{Colors.ENDC}")
+    
+    def __del__(self):
+        """Destructor to ensure cleanup"""
+        if hasattr(self, 'executor') and self.executor:
+            self.executor.shutdown(wait=False)
 
 
 async def main():
     '''
-    Main function.
+    Main function with cross-platform support.
     '''
-    if sys.platform == "win32": # for windows
+    # Set appropriate event loop policy based on platform
+    if sys.platform == "win32":  # Windows
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    elif sys.platform == "linux": # for linux
+    elif sys.platform in ["linux", "darwin"]:  # Linux and macOS
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+    elif sys.platform.startswith("freebsd"):  # FreeBSD
         asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
     else:
-        raise NotImplementedError(f"Platform {sys.platform} not supported")
+        # For other Unix-like systems, try default policy
+        print(f"Warning: Platform {sys.platform} not explicitly supported, using default event loop policy")
+        asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
     filename = input("Enter the filename : ").strip()
     processor = URLProcessor(filename)
